@@ -1,0 +1,365 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: nodeupgradepolicies.sks.whizus.com
+spec:
+  group: sks.whizus.com
+  names:
+    kind: NodeUpgradePolicy
+    listKind: NodeUpgradePolicyList
+    plural: nodeupgradepolicies
+    shortNames:
+    - nup
+    singular: nodeupgradepolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.targetVersion
+      name: Target
+      type: string
+    - jsonPath: .status.outdatedNodes
+      name: Outdated
+      type: integer
+    - jsonPath: .status.totalNodes
+      name: Total
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="WindowOpen")].status
+      name: Window
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: NodeUpgradePolicy is the Schema for the nodeupgradepolicies API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of NodeUpgradePolicy
+            properties:
+              drain:
+                description: drain controls how pods are moved off a node.
+                properties:
+                  deleteEmptyDirData:
+                    default: true
+                    description: deleteEmptyDirData allows evicting pods backed by
+                      an emptyDir volume.
+                    type: boolean
+                  disableEviction:
+                    default: false
+                    description: |-
+                      disableEviction deletes pods outright instead of using the Eviction API,
+                      which ignores PodDisruptionBudgets. Escape hatch only.
+                    type: boolean
+                  enabled:
+                    default: true
+                    description: |-
+                      enabled drains the node before replacing it. When false the node is only
+                      cordoned. Note that for Karpenter-managed nodes the control plane drains
+                      the node itself on NodeClaim deletion regardless of this setting.
+                    type: boolean
+                  force:
+                    default: false
+                    description: force allows evicting pods that are not managed by
+                      a controller.
+                    type: boolean
+                  gracePeriodSeconds:
+                    default: -1
+                    description: |-
+                      gracePeriodSeconds overrides each pod's termination grace period.
+                      -1 honours the pod's own setting.
+                    format: int32
+                    minimum: -1
+                    type: integer
+                  ignoreDaemonSets:
+                    default: true
+                    description: ignoreDaemonSets continues even though DaemonSet
+                      pods cannot be evicted.
+                    type: boolean
+                  timeout:
+                    default: 10m
+                    description: timeout bounds the drain.
+                    type: string
+                type: object
+              dryRun:
+                default: false
+                description: |-
+                  dryRun evaluates everything and reports it through status and events, but
+                  never cordons, drains, scales or evicts.
+                type: boolean
+              exoscale:
+                description: exoscale locates the SKS cluster.
+                properties:
+                  clusterID:
+                    description: |-
+                      clusterID is the SKS cluster UUID. Defaults to the cluster that owns a
+                      nodepool referenced by one of this cluster's nodes.
+                    type: string
+                  zone:
+                    description: |-
+                      zone is the Exoscale zone, e.g. "de-muc-1". Defaults to the zone read from
+                      the node labels, or the EXOSCALE_ZONE environment variable.
+                    type: string
+                type: object
+              historyLimit:
+                default: 10
+                description: historyLimit is how many finished NodeReplacement objects
+                  to retain.
+                format: int32
+                minimum: 0
+                type: integer
+              maintenanceWindows:
+                description: |-
+                  maintenanceWindows lists the periods during which replacements may start.
+                  An empty list means replacements never start.
+                items:
+                  description: |-
+                    MaintenanceWindow is a recurring period during which replacements may start.
+                    A replacement already in flight always runs to completion, even past the end
+                    of the window: leaving a node half-drained or a pool surged is worse than
+                    overrunning.
+                  properties:
+                    duration:
+                      description: duration is how long the window stays open after
+                        each start.
+                      example: 1h
+                      type: string
+                    schedule:
+                      description: schedule is a cron expression marking the START
+                        of the window.
+                      example: 0 2 * * *
+                      minLength: 1
+                      type: string
+                    timeZone:
+                      default: UTC
+                      description: timeZone is an IANA time zone name used to interpret
+                        schedule.
+                      example: Europe/Vienna
+                      type: string
+                  required:
+                  - duration
+                  - schedule
+                  type: object
+                type: array
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  nodeSelector limits the policy to nodes carrying these labels. Empty
+                  selects every node.
+                type: object
+              paused:
+                default: false
+                description: |-
+                  paused stops new replacements from being created. Replacements already in
+                  flight still run to completion.
+                type: boolean
+              rollout:
+                description: rollout bounds how fast and how far replacements go.
+                properties:
+                  cooldown:
+                    default: 5m
+                    description: cooldown is the quiet period after each successful
+                      replacement.
+                    type: string
+                  maxUnavailable:
+                    default: 1
+                    description: maxUnavailable is the number of replacements in flight
+                      cluster-wide.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  maxUnavailablePerPool:
+                    default: 1
+                    description: maxUnavailablePerPool is the number of replacements
+                      in flight per nodepool.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  nodeReadyTimeout:
+                    default: 15m
+                    description: nodeReadyTimeout bounds the wait for a surged node
+                      to become Ready.
+                    type: string
+                  replacementTimeout:
+                    default: 45m
+                    description: replacementTimeout bounds a single replacement end
+                      to end.
+                    type: string
+                type: object
+              strategies:
+                description: strategies configures the per-pool-type replacement mechanisms.
+                properties:
+                  karpenterManaged:
+                    description: karpenterManaged configures nodes owned by a Karpenter
+                      NodeClaim.
+                    properties:
+                      enabled:
+                        default: true
+                        description: |-
+                          enabled turns on replacement of Karpenter-managed nodes by deleting their
+                          NodeClaim. This is an involuntary disruption and therefore bypasses
+                          Karpenter's own disruption budgets; this policy's window and concurrency
+                          limits are the only gate.
+                        type: boolean
+                    type: object
+                  sksManaged:
+                    description: sksManaged configures nodes belonging to an SKS nodepool.
+                    properties:
+                      enabled:
+                        default: true
+                        description: enabled turns on replacement of SKS-managed nodes.
+                        type: boolean
+                    type: object
+                type: object
+              versionPolicy:
+                description: versionPolicy controls which version nodes are held to.
+                properties:
+                  pinnedVersion:
+                    description: pinnedVersion is the target version when source is
+                      Pinned.
+                    pattern: ^v?[0-9]+\.[0-9]+\.[0-9]+$
+                    type: string
+                  source:
+                    default: Auto
+                    description: source selects how the target version is resolved.
+                    enum:
+                    - Auto
+                    - ControlPlane
+                    - Pinned
+                    type: string
+                type: object
+            type: object
+          status:
+            description: status defines the observed state of NodeUpgradePolicy
+            properties:
+              activeReplacements:
+                description: activeReplacements names the NodeReplacement objects
+                  currently in flight.
+                items:
+                  type: string
+                type: array
+              conditions:
+                description: conditions represent the current state of the policy.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              controlPlaneVersion:
+                description: controlPlaneVersion is the Kubernetes version reported
+                  by the SKS cluster.
+                type: string
+              lastCompletedAt:
+                description: lastCompletedAt is when the most recent replacement finished.
+                format: date-time
+                type: string
+              nextWindowStart:
+                description: nextWindowStart is when the next maintenance window opens.
+                format: date-time
+                type: string
+              observedGeneration:
+                description: observedGeneration is the .metadata.generation this status
+                  was computed from.
+                format: int64
+                type: integer
+              outdatedNodes:
+                description: outdatedNodes is how many managed nodes run below targetVersion.
+                format: int32
+                type: integer
+              targetVersion:
+                description: targetVersion is the version nodes are currently held
+                  to.
+                type: string
+              targetVersionSource:
+                description: targetVersionSource explains where targetVersion came
+                  from.
+                type: string
+              totalNodes:
+                description: totalNodes is how many nodes this policy manages.
+                format: int32
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

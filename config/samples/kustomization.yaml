@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- sks_v1alpha1_nodeupgradepolicy.yaml
+- sks_v1alpha1_nodereplacement.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

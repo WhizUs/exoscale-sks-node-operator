@@ -1,0 +1,58 @@
+apiVersion: sks.whizus.com/v1alpha1
+kind: NodeUpgradePolicy
+metadata:
+  name: default
+spec:
+  # Set true to evaluate and report without cordoning, draining, scaling or
+  # evicting anything. Start here on a new cluster.
+  dryRun: false
+  paused: false
+
+  # Both are discovered from the nodes when omitted.
+  exoscale:
+    zone: de-muc-1
+    # clusterID: ""
+
+  # Replacements only START inside a window. One already in flight always runs
+  # to completion, because a half-drained node is worse than overrunning.
+  maintenanceWindows:
+    - schedule: "0 2 * * *"
+      duration: 1h
+      timeZone: Europe/Vienna
+
+  versionPolicy:
+    # Auto holds nodes to the highest of the control-plane version, the newest
+    # version Exoscale offers, and the highest kubelet already running, within
+    # the control plane's own minor. Nodes AHEAD of the control plane are not
+    # outdated: SKS boots new nodes on the newest patch, so that is normal.
+    source: Auto
+
+  rollout:
+    maxUnavailable: 1
+    maxUnavailablePerPool: 1
+    cooldown: 5m
+    nodeReadyTimeout: 15m
+    replacementTimeout: 45m
+
+  drain:
+    enabled: true
+    timeout: 10m
+    gracePeriodSeconds: -1
+    ignoreDaemonSets: true
+    deleteEmptyDirData: true
+    force: false
+    disableEviction: false
+
+  strategies:
+    sksManaged:
+      # The pool is always grown by one and the new node must be Ready before
+      # the outdated one is drained and evicted, so capacity never dips.
+      # Eviction shrinks the pool again, back to the size it started at.
+      enabled: true
+    karpenterManaged:
+      # Deleting a NodeClaim is an involuntary disruption and bypasses
+      # Karpenter's own disruption budgets, so this policy's window and
+      # concurrency limits are the only gate on that path.
+      enabled: true
+
+  historyLimit: 10

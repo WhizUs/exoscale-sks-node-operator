@@ -1,0 +1,19 @@
+# NodeReplacement objects are created by the controller, not by hand. This
+# sample only documents the shape; inspect real ones with
+#   kubectl get nodereplacements
+apiVersion: sks.whizus.com/v1alpha1
+kind: NodeReplacement
+metadata:
+  name: node-pool-a-1-1a2b3c4d
+  labels:
+    sks.whizus.com/policy: default
+    sks.whizus.com/node: node-pool-a-1
+spec:
+  nodeName: node-pool-a-1
+  policyName: default
+  poolType: SKSManaged
+  instanceID: bbbbbbbb-0000-0000-0000-000000000001
+  sksNodepoolID: aaaaaaaa-0000-0000-0000-000000000001
+  sksNodepoolName: sks-nodepool-a
+  targetVersion: v1.36.3
+  reason: kubelet v1.36.2 is below target v1.36.3 (AvailableSKSVersion)

@@ -170,6 +170,26 @@ make deploy IMG=ghcr.io/whizus/exoscale-sks-node-operator:dev
 
 `make build-installer` emits a single `dist/install.yaml` for GitOps.
 
+### Which kustomize path to install
+
+| path | ships a `Namespace` | use when |
+|---|---|---|
+| `config/default` | yes | standalone install; it creates and owns its own namespace. What `make deploy` and `make build-installer` use. |
+| `config/base` | no | installing into a namespace that already exists. |
+
+The distinction matters because kustomize's namespace transformer **renames** a `Namespace`
+object to whatever you retarget to. Retargeting `config/default` at an existing namespace
+rewrites its `Namespace` to that name, so the installation then creates and owns it — and
+under a GitOps tool with pruning enabled that puts the namespace itself within reach.
+`config/base` ships no `Namespace`, so retargeting it is safe:
+
+```sh
+cd config/base
+kustomize edit set namespace kube-system
+kustomize edit set image controller=ghcr.io/whizus/exoscale-sks-node-operator:v0.1.1
+kustomize build .
+```
+
 ## Development
 
 ```sh

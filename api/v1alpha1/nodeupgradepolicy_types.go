@@ -45,6 +45,7 @@ const (
 	ReasonReplacing         = "Replacing"
 	ReasonExoscaleError     = "ExoscaleError"
 	ReasonDryRun            = "DryRun"
+	ReasonCoolingDown       = "CoolingDown"
 )
 
 // VersionSource selects how the target Kubernetes version is resolved.

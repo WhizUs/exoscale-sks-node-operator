@@ -296,6 +296,65 @@ var _ = Describe("NodeUpgradePolicy controller", func() {
 		})
 	})
 
+	// Regression: rollout.cooldown was declared in the CRD with a 5m default but
+	// never read, so replacements ran back to back as fast as each node
+	// disappeared — on a busy cluster that is every node at once, with no quiet
+	// period in between.
+	Context("cooldown between replacements", func() {
+		BeforeEach(func() {
+			newSKSNode("node-a", defaultPoolID, olderVersion, "inst-a")
+			newSKSNode("node-b", defaultPoolID, olderVersion, "inst-b")
+			newSKSNode("node-current", defaultPoolID, newerVersion, "inst-current")
+		})
+
+		It("waits out the cooldown after a replacement finishes", func() {
+			newPolicy(policyName, func(p *sksv1alpha1.NodeUpgradePolicy) {
+				p.Spec.Rollout.Cooldown = metav1.Duration{Duration: 10 * time.Minute}
+			})
+			r := newPolicyReconciler(twoPoolFake(), "")
+			base := time.Now()
+			r.Now = func() time.Time { return base }
+
+			reconcile(r)
+			items := listReplacements()
+			Expect(items).To(HaveLen(1))
+
+			// Finish it, five minutes into a ten minute cooldown.
+			nr := items[0]
+			done := metav1.NewTime(base)
+			nr.Status.Phase = sksv1alpha1.PhaseCompleted
+			nr.Status.CompletedAt = &done
+			nr.Status.ReplacementNodeName = "node-fresh"
+			nr.Status.ReplacementNodeVersion = newerVersion
+			Expect(k8sClient.Status().Update(ctx, &nr)).To(Succeed())
+
+			r.Now = func() time.Time { return base.Add(5 * time.Minute) }
+			res := reconcile(r)
+
+			Expect(listReplacements()).To(HaveLen(1), "must not start the next node mid-cooldown")
+			policy := getPolicy(policyName)
+			Expect(conditionReason(policy.Status.Conditions, sksv1alpha1.ConditionReady)).
+				To(Equal(sksv1alpha1.ReasonCoolingDown))
+			Expect(policy.Status.LastCompletedAt).NotTo(BeNil())
+			Expect(res.RequeueAfter).To(BeNumerically("<=", 5*time.Minute))
+			Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+
+			// Past the cooldown, the next node goes.
+			r.Now = func() time.Time { return base.Add(11 * time.Minute) }
+			reconcile(r)
+			Expect(listReplacements()).To(HaveLen(2))
+		})
+
+		It("does not stall when nothing has completed yet", func() {
+			newPolicy(policyName, func(p *sksv1alpha1.NodeUpgradePolicy) {
+				p.Spec.Rollout.Cooldown = metav1.Duration{Duration: time.Hour}
+			})
+			reconcile(newPolicyReconciler(twoPoolFake(), ""))
+			Expect(listReplacements()).To(HaveLen(1))
+			Expect(getPolicy(policyName).Status.LastCompletedAt).To(BeNil())
+		})
+	})
+
 	It("reports an invalid maintenance window instead of retrying it forever", func() {
 		newSKSNode("node-x", defaultPoolID, olderVersion, "inst-x")
 		newPolicy(policyName, func(p *sksv1alpha1.NodeUpgradePolicy) {

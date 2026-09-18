@@ -232,6 +232,7 @@ func (r *NodeUpgradePolicyReconciler) evaluate(
 	}
 	active := activeReplacements(replacements)
 	st.status.ActiveReplacements = namesOf(active)
+	st.status.LastCompletedAt = lastCompletion(replacements)
 
 	outdated := outdatedCandidates(managed, target.Version)
 	st.status.OutdatedNodes = int32(len(outdated))
@@ -273,6 +274,19 @@ func (r *NodeUpgradePolicyReconciler) evaluate(
 	case !open:
 		st.setCondition(sksv1alpha1.ConditionReady, "True", sksv1alpha1.ReasonOutOfWindow,
 			fmt.Sprintf("%d node(s) outdated; waiting for the maintenance window", len(outdated)))
+		return ctrl.Result{RequeueAfter: requeue}, nil
+	}
+
+	// One replacement per cooldown, so the cluster gets a quiet period to settle
+	// before the next node is taken. Without this, rotations run back to back as
+	// fast as each node disappears.
+	if left := r.cooldownRemaining(st); left > 0 {
+		st.setCondition(sksv1alpha1.ConditionReady, "True", sksv1alpha1.ReasonCoolingDown,
+			fmt.Sprintf("%d node(s) outdated; cooling down for another %s after the last replacement",
+				len(outdated), left.Round(time.Second)))
+		if left < requeue {
+			requeue = left
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -668,6 +682,7 @@ func (r *NodeUpgradePolicyReconciler) updateStatus(ctx context.Context, st *poli
 	policy.Status.TotalNodes = st.status.TotalNodes
 	policy.Status.ActiveReplacements = st.status.ActiveReplacements
 	policy.Status.NextWindowStart = st.status.NextWindowStart
+	policy.Status.LastCompletedAt = st.status.LastCompletedAt
 
 	applied := map[string]bool{}
 	for _, cond := range st.conditions {
@@ -750,6 +765,37 @@ func namesOf(items []sksv1alpha1.NodeReplacement) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// lastCompletion is the most recent moment a replacement reached a terminal
+// phase. Derived from the owned objects rather than tracked separately, so it
+// survives a restart and cannot drift out of step with them.
+func lastCompletion(all []sksv1alpha1.NodeReplacement) *metav1.Time {
+	var newest *metav1.Time
+	for i := range all {
+		done := all[i].Status.CompletedAt
+		if done == nil {
+			continue
+		}
+		if newest == nil || done.After(newest.Time) {
+			newest = done
+		}
+	}
+	return newest
+}
+
+// cooldownRemaining reports how long is left of the quiet period, or zero when
+// a replacement may start.
+func (r *NodeUpgradePolicyReconciler) cooldownRemaining(st *policyState) time.Duration {
+	if st.status.LastCompletedAt == nil {
+		return 0
+	}
+	cooldown := st.policy.Spec.Rollout.CooldownOrDefault()
+	elapsed := st.now.Sub(st.status.LastCompletedAt.Time)
+	if elapsed >= cooldown {
+		return 0
+	}
+	return cooldown - elapsed
 }
 
 func requeueDelay(windows window.Set, now time.Time) time.Duration {

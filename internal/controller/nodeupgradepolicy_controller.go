@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -368,6 +369,9 @@ func (r *NodeUpgradePolicyReconciler) exoscaleClient(
 		if opts.NodepoolIDHint == "" && m.info.SKSNodepoolID != "" {
 			opts.NodepoolIDHint = m.info.SKSNodepoolID
 		}
+	}
+	if opts.Zone == "" {
+		opts.Zone = os.Getenv("EXOSCALE_ZONE")
 	}
 	if opts.Zone == "" {
 		return nil, fmt.Errorf(

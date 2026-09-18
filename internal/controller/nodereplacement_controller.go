@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -714,11 +715,56 @@ func (r *NodeReplacementReconciler) client(
 	nr *sksv1alpha1.NodeReplacement,
 	policy *sksv1alpha1.NodeUpgradePolicy,
 ) (exoscale.Client, error) {
+	zone, err := r.resolveZone(ctx, nr, policy)
+	if err != nil {
+		return nil, err
+	}
 	return r.Exoscale.Get(ctx, exoscale.Options{
-		Zone:           policy.Spec.Exoscale.Zone,
+		Zone:           zone,
 		ClusterID:      policy.Spec.Exoscale.ClusterID,
 		NodepoolIDHint: nr.Spec.SKSNodepoolID,
 	})
+}
+
+// resolveZone mirrors the discovery the policy reconciler does. Reading only
+// spec.exoscale.zone meant every dry run passed while the execution path could
+// not build a client at all: dry run never creates a NodeReplacement, so this
+// code never ran until the first live rotation.
+func (r *NodeReplacementReconciler) resolveZone(
+	ctx context.Context,
+	nr *sksv1alpha1.NodeReplacement,
+	policy *sksv1alpha1.NodeUpgradePolicy,
+) (string, error) {
+	if z := policy.Spec.Exoscale.Zone; z != "" {
+		return z, nil
+	}
+
+	// The node itself, while it still exists.
+	if node, err := r.getNode(ctx, nr.Spec.NodeName); err == nil && node != nil {
+		if z := nodes.Classify(node).Zone; z != "" {
+			return z, nil
+		}
+	}
+
+	// Past eviction the node is gone, so fall back to a peer in the same pool.
+	if nr.Spec.SKSNodepoolID != "" {
+		var list corev1.NodeList
+		if err := r.List(ctx, &list, client.MatchingLabels{
+			nodes.SKSNodepoolIDLabel: nr.Spec.SKSNodepoolID,
+		}); err == nil {
+			for i := range list.Items {
+				if z := nodes.Classify(&list.Items[i]).Zone; z != "" {
+					return z, nil
+				}
+			}
+		}
+	}
+
+	if z := os.Getenv("EXOSCALE_ZONE"); z != "" {
+		return z, nil
+	}
+	return "", fmt.Errorf(
+		"cannot determine the Exoscale zone for %s: set spec.exoscale.zone", nr.Spec.NodeName)
 }
 
 func (r *NodeReplacementReconciler) nodepool(

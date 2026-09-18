@@ -73,12 +73,18 @@ func (p *LazyProvider) Get(ctx context.Context, opts Options) (Client, error) {
 }
 
 // StaticProvider always returns the same client. Used by tests.
-type StaticProvider struct{ Client Client }
+type StaticProvider struct {
+	Client Client
+	// LastOptions records what the caller resolved before asking, so tests can
+	// assert zone and cluster discovery rather than only the end result.
+	LastOptions Options
+}
 
 var _ Provider = (*StaticProvider)(nil)
 
 // Get implements Provider.
-func (p *StaticProvider) Get(_ context.Context, _ Options) (Client, error) {
+func (p *StaticProvider) Get(_ context.Context, opts Options) (Client, error) {
+	p.LastOptions = opts
 	if p.Client == nil {
 		return nil, fmt.Errorf("no exoscale client configured")
 	}

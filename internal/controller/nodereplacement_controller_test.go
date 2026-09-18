@@ -396,6 +396,82 @@ var _ = Describe("NodeReplacement controller", func() {
 		})
 	})
 
+	// Regression: the replacement reconciler read spec.exoscale.zone with no
+	// fallback while the policy reconciler discovered it from node labels. Every
+	// dry run therefore passed -- dry run never creates a NodeReplacement -- and
+	// the first live rotation failed with "exoscale zone is required".
+	Context("resolving the Exoscale zone", func() {
+		var provider *exoscale.StaticProvider
+
+		reconcilerWithProvider := func() *NodeReplacementReconciler {
+			clientset, err := kubernetes.NewForConfig(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			provider = &exoscale.StaticProvider{Client: fake}
+			return &NodeReplacementReconciler{
+				Client:   k8sClient,
+				Scheme:   k8sClient.Scheme(),
+				Recorder: events.NewFakeRecorder(256),
+				Exoscale: provider,
+				Drainer:  nodes.NewDrainer(clientset),
+			}
+		}
+
+		It("discovers the zone from the node when the policy does not set one", func() {
+			newPolicy(policyName) // spec.exoscale.zone deliberately empty
+			newSKSNode(oldNode, defaultPoolID, olderVersion, oldInstace)
+
+			name := newReplacement()
+			r := reconcilerWithProvider()
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+
+			Expect(provider.LastOptions.Zone).To(Equal("de-muc-1"),
+				"zone must come from the node's topology label")
+			Expect(getReplacement(name).Status.Message).NotTo(ContainSubstring("zone is required"))
+		})
+
+		// Asserted directly: by the time the target node is gone the phase handlers
+		// short-circuit to Completed, but the rollback and evict-wait paths still
+		// need a client, and they run after the node has disappeared.
+		It("falls back to a pool peer once the node itself is gone", func() {
+			policy := newPolicy(policyName)
+			newSKSNode("pool-peer", defaultPoolID, newerVersion, "inst-peer")
+			r := reconcilerWithProvider()
+
+			nr := &sksv1alpha1.NodeReplacement{
+				Spec: sksv1alpha1.NodeReplacementSpec{
+					NodeName:      "already-deleted",
+					SKSNodepoolID: defaultPoolID,
+				},
+			}
+			zone, err := r.resolveZone(ctx, nr, policy)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(zone).To(Equal("de-muc-1"))
+		})
+
+		It("reports a clear error when the zone cannot be determined at all", func() {
+			policy := newPolicy(policyName)
+			r := reconcilerWithProvider()
+
+			nr := &sksv1alpha1.NodeReplacement{
+				Spec: sksv1alpha1.NodeReplacementSpec{NodeName: "nowhere"},
+			}
+			_, err := r.resolveZone(ctx, nr, policy)
+			Expect(err).To(MatchError(ContainSubstring("set spec.exoscale.zone")))
+		})
+
+		It("prefers an explicit spec.exoscale.zone over discovery", func() {
+			newPolicy(policyName, func(p *sksv1alpha1.NodeUpgradePolicy) {
+				p.Spec.Exoscale.Zone = "ch-gva-2"
+			})
+			newSKSNode(oldNode, defaultPoolID, olderVersion, oldInstace)
+
+			name := newReplacement()
+			r := reconcilerWithProvider()
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			Expect(provider.LastOptions.Zone).To(Equal("ch-gva-2"))
+		})
+	})
+
 	It("completes immediately when the node is already gone", func() {
 		newPolicy(policyName)
 		name := newReplacement()

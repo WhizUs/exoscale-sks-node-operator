@@ -79,7 +79,7 @@ type Options struct {
 	// EXOSCALE_API_KEY and EXOSCALE_API_SECRET.
 	APIKey    string
 	APISecret string
-	// Zone is the Exoscale zone, e.g. "de-muc-1".
+	// Zone is the Exoscale zone, e.g. "ch-gva-2".
 	Zone string
 	// ClusterID is the SKS cluster UUID. When empty it is discovered from
 	// NodepoolIDHint.

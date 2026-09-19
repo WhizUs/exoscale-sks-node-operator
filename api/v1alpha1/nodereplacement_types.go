@@ -34,7 +34,7 @@ const (
 )
 
 // ReplacementPhase is the position of a replacement in its state machine.
-// +kubebuilder:validation:Enum=Pending;ScalingUp;WaitingForNode;Cordoning;Draining;Evicting;Deleting;Completed;Failed
+// +kubebuilder:validation:Enum=Pending;ScalingUp;WaitingForNode;Cordoning;Draining;Evicting;Deleting;Settling;Completed;Failed
 type ReplacementPhase string
 
 const (
@@ -52,6 +52,12 @@ const (
 	PhaseEvicting ReplacementPhase = "Evicting"
 	// PhaseDeleting deletes the Karpenter NodeClaim.
 	PhaseDeleting ReplacementPhase = "Deleting"
+	// PhaseSettling waits for the pods displaced by this replacement to become
+	// schedulable again. It is deliberately non-terminal: it holds the
+	// rotation's slot against maxUnavailable and defers completedAt -- and with
+	// it the cooldown -- so the next rotation cannot start while this one's
+	// workloads are still coming up.
+	PhaseSettling ReplacementPhase = "Settling"
 	// PhaseCompleted is terminal and successful.
 	PhaseCompleted ReplacementPhase = "Completed"
 	// PhaseFailed is terminal and unsuccessful; no further action is taken.
@@ -145,6 +151,12 @@ type NodeReplacementStatus struct {
 	// replacementNodeName is the node that appeared in place of the old one.
 	// +optional
 	ReplacementNodeName string `json:"replacementNodeName,omitempty"`
+
+	// replacementNodeReadyAt is when the replacement node was first seen Ready.
+	// The wait for its DaemonSet pods is measured from here rather than from the
+	// phase start, so a slow-to-appear node does not eat that budget.
+	// +optional
+	ReplacementNodeReadyAt *metav1.Time `json:"replacementNodeReadyAt,omitempty"`
 
 	// replacementNodeVersion is the kubelet version the replacement came up with.
 	// A value below spec.targetVersion means the target is not actually

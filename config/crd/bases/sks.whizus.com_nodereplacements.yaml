@@ -212,6 +212,7 @@ spec:
                 - Draining
                 - Evicting
                 - Deleting
+                - Settling
                 - Completed
                 - Failed
                 type: string
@@ -233,6 +234,13 @@ spec:
               replacementNodeName:
                 description: replacementNodeName is the node that appeared in place
                   of the old one.
+                type: string
+              replacementNodeReadyAt:
+                description: |-
+                  replacementNodeReadyAt is when the replacement node was first seen Ready.
+                  The wait for its DaemonSet pods is measured from here rather than from the
+                  phase start, so a slow-to-appear node does not eat that budget.
+                format: date-time
                 type: string
               replacementNodeVersion:
                 description: |-

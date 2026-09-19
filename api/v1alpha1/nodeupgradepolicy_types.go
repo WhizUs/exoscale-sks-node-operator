@@ -67,7 +67,7 @@ const (
 // ExoscaleSpec locates the SKS cluster. Both fields are discovered from the
 // Node objects when left empty.
 type ExoscaleSpec struct {
-	// zone is the Exoscale zone, e.g. "de-muc-1". Defaults to the zone read from
+	// zone is the Exoscale zone, e.g. "ch-gva-2". Defaults to the zone read from
 	// the node labels, or the EXOSCALE_ZONE environment variable.
 	// +optional
 	Zone string `json:"zone,omitempty"`
@@ -137,6 +137,21 @@ type RolloutSpec struct {
 	// +kubebuilder:default="15m"
 	// +optional
 	NodeReadyTimeout metav1.Duration `json:"nodeReadyTimeout,omitempty"`
+
+	// settleTimeout bounds the two waits for workloads rather than nodes: the
+	// replacement node's DaemonSet pods becoming Ready before anything is
+	// drained onto it, and the pods displaced by the drain becoming schedulable
+	// again before the replacement is considered complete.
+	//
+	// A node reports Ready with no workload images pulled, so treating Ready as
+	// "this node can carry load" drains onto a node that cannot yet serve, and
+	// releases the next rotation while the previous one is still cold.
+	//
+	// Neither wait ever fails a replacement: on expiry it warns and proceeds.
+	// Set to 0 to disable both and gate on node readiness alone.
+	// +kubebuilder:default="10m"
+	// +optional
+	SettleTimeout *metav1.Duration `json:"settleTimeout,omitempty"`
 
 	// replacementTimeout bounds a single replacement end to end.
 	// +kubebuilder:default="45m"

@@ -222,6 +222,7 @@ func main() {
 		Recorder:                mgr.GetEventRecorder("nodereplacement"),
 		Exoscale:                exoProvider,
 		Drainer:                 nodes.NewDrainer(clientset),
+		Clientset:               clientset,
 		MaxConcurrentReconciles: maxConcurrentReplacements,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "nodereplacement")

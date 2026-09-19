@@ -53,11 +53,12 @@ var _ = Describe("NodeReplacement controller", func() {
 		clientset, err := kubernetes.NewForConfig(cfg)
 		Expect(err).NotTo(HaveOccurred())
 		return &NodeReplacementReconciler{
-			Client:   k8sClient,
-			Scheme:   k8sClient.Scheme(),
-			Recorder: events.NewFakeRecorder(256),
-			Exoscale: &exoscale.StaticProvider{Client: fake},
-			Drainer:  nodes.NewDrainer(clientset),
+			Client:    k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  events.NewFakeRecorder(256),
+			Exoscale:  &exoscale.StaticProvider{Client: fake},
+			Drainer:   nodes.NewDrainer(clientset),
+			Clientset: clientset,
 		}
 	}
 
@@ -291,6 +292,196 @@ var _ = Describe("NodeReplacement controller", func() {
 		})
 	})
 
+	// A node reports Ready roughly 45s after creation with no workload images
+	// pulled. Gating on that alone drains onto a node that cannot serve yet, and
+	// releases the next rotation while this one's pods are still starting -- on a
+	// two-node pool, where every workload has to relocate onto fresh nodes, that
+	// compounds into minutes of downtime.
+	Context("waiting for workloads rather than nodes", func() {
+		const freshNode = "node-pool-a-fresh"
+
+		BeforeEach(func() {
+			newPolicy(policyName)
+			newSKSNode(oldNode, defaultPoolID, olderVersion, oldInstace)
+
+			fake.OnScale = func(poolID string, size int64) {
+				if poolID != defaultPoolID || size < 2 {
+					return
+				}
+				newSKSNode(freshNode, defaultPoolID, newerVersion, "inst-fresh")
+			}
+			fake.OnEvict = func(_, _ string) {
+				node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: oldNode}}
+				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, node))).To(Succeed())
+			}
+		})
+
+		// runTo drives the state machine until it reaches target or runs out of
+		// steps, so a test can stop on a non-terminal phase.
+		runTo := func(r *NodeReplacementReconciler, name string, target sksv1alpha1.ReplacementPhase, steps int) {
+			GinkgoHelper()
+			var phase sksv1alpha1.ReplacementPhase
+			for range steps {
+				phase = step(r, name)
+				if phase == target {
+					return
+				}
+			}
+			Fail(fmt.Sprintf("never reached %s (stopped at %s)", target, phase))
+		}
+
+		It("holds the rotation open until the pods it displaced are scheduled", func() {
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			// Started first, so the pod below is unambiguously created by this
+			// rotation rather than pre-existing.
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			displaced := newPod("displaced-workload")
+
+			runTo(r, name, sksv1alpha1.PhaseSettling, 20)
+
+			// The old node is gone, but the replacement is deliberately not done.
+			Expect(apierrors.IsNotFound(
+				k8sClient.Get(ctx, client.ObjectKey{Name: oldNode}, &corev1.Node{}))).To(BeTrue())
+
+			for range 3 {
+				Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseSettling))
+			}
+			Expect(getReplacement(name).Status.Message).To(ContainSubstring("displaced-workload"))
+
+			// completedAt is what the cooldown is measured from, so leaving it
+			// unset is what actually keeps the next rotation back.
+			Expect(getReplacement(name).Status.CompletedAt).To(BeNil())
+
+			markPodPhase(displaced, corev1.PodRunning, true)
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseCompleted))
+			Expect(getReplacement(name).Status.CompletedAt).NotTo(BeNil())
+		})
+
+		It("counts as in-flight while settling, so no second rotation starts", func() {
+			// In the other pool: a second outdated node in this one would compete
+			// with the surged node for "newest in the pool".
+			newSKSNode("node-pool-b-1", infraPoolID, olderVersion, "inst-second")
+
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			newPod("displaced-workload")
+			runTo(r, name, sksv1alpha1.PhaseSettling, 20)
+
+			// Asserted directly against the budget input: were Settling terminal,
+			// the end-to-end check below would still pass, because completedAt
+			// would be stamped and the cooldown would suppress the next rotation
+			// for the wrong reason.
+			Expect(activeReplacements(listReplacements())).To(HaveLen(1))
+
+			// And end to end: maxUnavailable is 1, so no second rotation starts.
+			pr := newPolicyReconciler(fake, "")
+			_, err := pr.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: policyName}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(listReplacements()).To(HaveLen(1))
+		})
+
+		// Real clusters carry pods that have been unschedulable for months. An
+		// unscoped gate would wait on them forever and wedge every rotation.
+		It("ignores pods that were already pending before it started", func() {
+			newPod("pending-for-months")
+
+			name := newReplacement()
+			r := newReplacementReconciler()
+			// Creation timestamps are second-granular, so simply creating the pod
+			// first does not put it before startedAt. Offsetting the reconciler's
+			// clock makes the ordering unambiguous.
+			r.Now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+
+			Expect(run(r, name, 20)).To(Equal(sksv1alpha1.PhaseCompleted))
+		})
+
+		It("warns and completes rather than failing when settling times out", func() {
+			policy := getPolicy(policyName)
+			policy.Spec.Rollout.SettleTimeout = &metav1.Duration{Duration: time.Minute}
+			Expect(k8sClient.Update(ctx, policy)).To(Succeed())
+
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			newPod("never-schedules")
+			runTo(r, name, sksv1alpha1.PhaseSettling, 20)
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseSettling))
+
+			// Jump past the settle timeout. The node was genuinely replaced, so
+			// this must complete rather than roll a finished eviction back.
+			r.Now = func() time.Time { return time.Now().Add(10 * time.Minute) }
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseCompleted))
+			nr := getReplacement(name)
+			Expect(nr.Status.Message).To(ContainSubstring("never-schedules"))
+			Expect(conditionStatus(nr.Status.Conditions, sksv1alpha1.ConditionSucceeded)).
+				To(Equal(metav1.ConditionTrue))
+		})
+
+		It("does not drain onto the replacement until its DaemonSets are Ready", func() {
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseWaitingForNode))
+
+			ds := newDaemonSet("ingress")
+			agent := newPod("ingress-agent", ownedBy(ds, freshNode))
+
+			// The node is Ready and on the right version, but its ingress agent
+			// is still pulling.
+			for range 3 {
+				Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseWaitingForNode))
+			}
+			Expect(getNode(oldNode).Spec.Unschedulable).To(BeFalse())
+			Expect(getReplacement(name).Status.Message).To(ContainSubstring("ingress-agent"))
+			Expect(getReplacement(name).Status.ReplacementNodeReadyAt).NotTo(BeNil())
+
+			markPodPhase(agent, corev1.PodRunning, true)
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseCordoning))
+		})
+
+		It("proceeds anyway once the DaemonSet wait exceeds the settle timeout", func() {
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseWaitingForNode))
+
+			ds := newDaemonSet("ingress")
+			newPod("ingress-agent", ownedBy(ds, freshNode))
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseWaitingForNode))
+
+			r.Now = func() time.Time { return time.Now().Add(30 * time.Minute) }
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseCordoning))
+		})
+
+		It("gates on node readiness alone when settleTimeout is zero", func() {
+			policy := getPolicy(policyName)
+			policy.Spec.Rollout.SettleTimeout = &metav1.Duration{}
+			Expect(k8sClient.Update(ctx, policy)).To(Succeed())
+
+			name := newReplacement()
+			r := newReplacementReconciler()
+
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
+			newPod("would-otherwise-hold-it")
+
+			ds := newDaemonSet("ingress")
+			newPod("ingress-agent", ownedBy(ds, freshNode))
+
+			Expect(run(r, name, 20)).To(Equal(sksv1alpha1.PhaseCompleted))
+		})
+	})
+
 	Context("Karpenter-managed node", func() {
 		const karpNode = "k-node-d-1"
 
@@ -318,10 +509,12 @@ var _ = Describe("NodeReplacement controller", func() {
 			Expect(nodeClaimExists(karpNode + "-claim")).To(BeFalse())
 			Expect(getReplacement(name).Status.ActionIssued).To(BeTrue())
 
-			// Karpenter's termination removes the Node; then it completes.
+			// Karpenter's termination removes the Node; the rotation then settles
+			// and, with nothing displaced still pending, completes.
 			Expect(k8sClient.Delete(ctx, &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{Name: karpNode},
 			})).To(Succeed())
+			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseSettling))
 			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseCompleted))
 
 			// No SKS API call was made for a Karpenter node.
@@ -408,11 +601,12 @@ var _ = Describe("NodeReplacement controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			provider = &exoscale.StaticProvider{Client: fake}
 			return &NodeReplacementReconciler{
-				Client:   k8sClient,
-				Scheme:   k8sClient.Scheme(),
-				Recorder: events.NewFakeRecorder(256),
-				Exoscale: provider,
-				Drainer:  nodes.NewDrainer(clientset),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				Recorder:  events.NewFakeRecorder(256),
+				Exoscale:  provider,
+				Drainer:   nodes.NewDrainer(clientset),
+				Clientset: clientset,
 			}
 		}
 
@@ -424,7 +618,7 @@ var _ = Describe("NodeReplacement controller", func() {
 			r := reconcilerWithProvider()
 			Expect(step(r, name)).To(Equal(sksv1alpha1.PhaseScalingUp))
 
-			Expect(provider.LastOptions.Zone).To(Equal("de-muc-1"),
+			Expect(provider.LastOptions.Zone).To(Equal("ch-gva-2"),
 				"zone must come from the node's topology label")
 			Expect(getReplacement(name).Status.Message).NotTo(ContainSubstring("zone is required"))
 		})
@@ -445,7 +639,7 @@ var _ = Describe("NodeReplacement controller", func() {
 			}
 			zone, err := r.resolveZone(ctx, nr, policy)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(zone).To(Equal("de-muc-1"))
+			Expect(zone).To(Equal("ch-gva-2"))
 		})
 
 		It("reports a clear error when the zone cannot be determined at all", func() {

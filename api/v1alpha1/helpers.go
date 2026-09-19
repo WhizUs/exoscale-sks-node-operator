@@ -96,6 +96,16 @@ func (r RolloutSpec) NodeReadyTimeoutOrDefault() time.Duration {
 	return durationOr(r.NodeReadyTimeout.Duration, 15*time.Minute)
 }
 
+// SettleTimeoutOrDefault bounds the waits for workload readiness. A nil field
+// means unset and takes the default; an explicit 0 disables those waits, so the
+// two cases are deliberately distinguishable.
+func (r RolloutSpec) SettleTimeoutOrDefault() time.Duration {
+	if r.SettleTimeout == nil {
+		return 10 * time.Minute
+	}
+	return r.SettleTimeout.Duration
+}
+
 // ReplacementTimeoutOrDefault bounds a replacement end to end.
 func (r RolloutSpec) ReplacementTimeoutOrDefault() time.Duration {
 	return durationOr(r.ReplacementTimeout.Duration, 45*time.Minute)

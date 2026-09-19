@@ -32,7 +32,7 @@ func sksNode() *corev1.Node {
 			Name: "node-pool-a-1",
 			Labels: map[string]string{
 				SKSNodepoolIDLabel:                 "aaaaaaaa-0000-0000-0000-000000000001",
-				RegionLabel:                        "de-muc-1",
+				RegionLabel:                        "ch-gva-2",
 				"node.kubernetes.io/instance-type": "standard.large",
 			},
 		},
@@ -55,7 +55,7 @@ func karpenterNode() *corev1.Node {
 				KarpenterNodePoolLabel:                     "karpenter-pool-d",
 				"karpenter.exoscale.com/exoscalenodeclass": "batch",
 				"karpenter.sh/registered":                  "true",
-				ZoneLabel:                                  "de-muc-1",
+				ZoneLabel:                                  "ch-gva-2",
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: NodeClaimAPIVersion,
@@ -91,8 +91,8 @@ func TestClassify_SKSManaged(t *testing.T) {
 	if got.KubeletVersion != "v1.36.2" {
 		t.Errorf("KubeletVersion = %q, want v1.36.2", got.KubeletVersion)
 	}
-	if got.Zone != "de-muc-1" {
-		t.Errorf("Zone = %q, want de-muc-1", got.Zone)
+	if got.Zone != "ch-gva-2" {
+		t.Errorf("Zone = %q, want ch-gva-2", got.Zone)
 	}
 	if !got.Ready || !got.Managed() {
 		t.Errorf("Ready = %v, Managed = %v; want both true", got.Ready, got.Managed())
@@ -120,8 +120,8 @@ func TestClassify_KarpenterManaged(t *testing.T) {
 	if got.SKSNodepoolID != "" {
 		t.Errorf("SKSNodepoolID = %q, want empty for a Karpenter node", got.SKSNodepoolID)
 	}
-	if got.Zone != "de-muc-1" {
-		t.Errorf("Zone = %q, want de-muc-1", got.Zone)
+	if got.Zone != "ch-gva-2" {
+		t.Errorf("Zone = %q, want ch-gva-2", got.Zone)
 	}
 }
 

@@ -60,12 +60,12 @@ Nodes are classified from their own labels — no API walk:
 | **Karpenter-managed** | `karpenter.sh/nodepool` + a `NodeClaim` owner reference | drain, then delete the `NodeClaim` |
 
 The SKS flow is `Pending → ScalingUp → WaitingForNode → Cordoning → Draining → Evicting
-→ Completed`. The pool is always grown by one first, because
+→ Settling → Completed`. The pool is always grown by one first, because
 **`EvictSKSNodepoolMembers` shrinks the pool by one** — scaling up first and evicting
 after leaves the pool at the size it started at and never dips capacity.
 
-Karpenter's flow is `Pending → Cordoning → Draining → Deleting → Completed`. Karpenter
-reprovisions on pending pods, so there is no surge.
+Karpenter's flow is `Pending → Cordoning → Draining → Deleting → Settling → Completed`.
+Karpenter reprovisions on pending pods, so there is no surge.
 
 Each rotation gets its own `NodeReplacement` object holding the phase, because the flow
 spans minutes of asynchronous cloud operations and must survive a restart — including the
@@ -91,6 +91,23 @@ and DaemonSet, mirror and static pods are filtered rather than blocking forever.
   first. Otherwise the pool is left one node larger with a `SurgeNotReclaimed` warning, for
   the autoscaler to reclaim gracefully: scaling down blindly lets Exoscale choose the
   victim, and it can pick a node still carrying undrained workload.
+- **Readiness is measured in workloads, not nodes.** A node reports `Ready` within
+  about a minute of creation, having pulled no images at all. Draining onto it at
+  that point moves pods onto a node that cannot run them yet, and stamping the
+  rotation complete there lets the *next* rotation drain the last warm node while
+  this one is still cold — on a small pool that compounds into minutes of real
+  downtime. So two waits gate on pods instead: the replacement node's DaemonSets
+  must be Ready before anything is drained onto it, and the pods this rotation
+  displaced must be scheduled again before it reaches `Completed`. The second is
+  the `Settling` phase, and because it is non-terminal it holds the rotation's
+  slot against `maxUnavailable` and defers the cooldown's start.
+
+  Both are bounded by `rollout.settleTimeout` (default `10m`) and **neither ever
+  fails a replacement**: on expiry they emit a warning and carry on, because the
+  node genuinely was replaced and rolling a finished eviction back over a slow
+  image pull would be worse. Displaced pods are matched by creation time, so pods
+  that were already unschedulable before the rotation started cannot wedge it.
+  Set `settleTimeout: 0` to gate on node readiness alone.
 - **Waiting is bounded by time, never by an attempt count.** Status writes re-trigger the
   controller through its own watch, so a counter burns through in seconds rather than
   minutes.
@@ -126,6 +143,7 @@ spec:
       timeZone: Europe/Vienna
   rollout:
     maxUnavailable: 1
+    settleTimeout: 10m
   drain:
     enabled: true
   strategies:
@@ -156,7 +174,7 @@ Out of cluster, against whatever `KUBECONFIG` points at:
 
 ```sh
 export KUBECONFIG=...            # or pass --kubeconfig
-export EXOSCALE_API_KEY=...  EXOSCALE_API_SECRET=...  EXOSCALE_ZONE=de-muc-1
+export EXOSCALE_API_KEY=...  EXOSCALE_API_SECRET=...  EXOSCALE_ZONE=ch-gva-2
 make install-crds
 make run-local
 ```

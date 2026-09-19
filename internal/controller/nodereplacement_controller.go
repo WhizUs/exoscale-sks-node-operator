@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -73,6 +74,11 @@ type NodeReplacementReconciler struct {
 	Recorder events.EventRecorder
 	Exoscale exoscale.Provider
 	Drainer  *nodes.Drainer
+
+	// Clientset reads pod state for the workload-readiness waits. Those use
+	// field selectors rather than the controller-runtime cache, which would
+	// otherwise have to watch every pod in the cluster to answer them.
+	Clientset kubernetes.Interface
 
 	// MaxConcurrentReconciles bounds parallel rotations. Draining blocks its
 	// worker for up to the drain timeout, so this must exceed the highest
@@ -155,7 +161,7 @@ func (r *NodeReplacementReconciler) advance(
 		// wait wrote status, the write re-triggered this controller through its
 		// own watch, and the counter burned through in seconds — long before the
 		// real timeout could apply.
-		if elapsed := r.phaseElapsed(nr); elapsed > waitBudget {
+		if elapsed := r.phaseElapsed(nr); elapsed > waitBudget && !managesOwnDeadline(nr.Status.Phase) {
 			r.fail(nr, "PhaseTimeout", fmt.Sprintf(
 				"phase %s did not settle within %s: %s", nr.Status.Phase, waitBudget, nr.Status.Message))
 			return r.finishFailed(ctx, nr, policy)
@@ -216,6 +222,8 @@ func (r *NodeReplacementReconciler) handlerFor(phase sksv1alpha1.ReplacementPhas
 		return r.handleEvicting
 	case sksv1alpha1.PhaseDeleting:
 		return r.handleDeleting
+	case sksv1alpha1.PhaseSettling:
+		return r.handleSettling
 	default:
 		return nil
 	}
@@ -307,13 +315,6 @@ func (r *NodeReplacementReconciler) handleWaitingForNode(
 	nr *sksv1alpha1.NodeReplacement,
 	policy *sksv1alpha1.NodeUpgradePolicy,
 ) (sksv1alpha1.ReplacementPhase, error) {
-	if r.phaseElapsed(nr) > policy.Spec.Rollout.NodeReadyTimeoutOrDefault() {
-		r.fail(nr, "NodeReadyTimeout", fmt.Sprintf(
-			"no replacement node became Ready within %s",
-			policy.Spec.Rollout.NodeReadyTimeoutOrDefault()))
-		return sksv1alpha1.PhaseFailed, nil
-	}
-
 	pool, err := r.nodepool(ctx, nr, policy)
 	if err != nil {
 		return nr.Status.Phase, err
@@ -329,6 +330,15 @@ func (r *NodeReplacementReconciler) handleWaitingForNode(
 		want = *nr.Status.PoolSizeBefore + 1
 	}
 	if int64(ready) < want || newest == nil {
+		// nodeReadyTimeout bounds only this part: a node appearing at all. Once
+		// one is Ready the surge succeeded, and the remaining wait is for its
+		// DaemonSets, which must never fail the replacement.
+		if r.phaseElapsed(nr) > policy.Spec.Rollout.NodeReadyTimeoutOrDefault() {
+			r.fail(nr, "NodeReadyTimeout", fmt.Sprintf(
+				"no replacement node became Ready within %s",
+				policy.Spec.Rollout.NodeReadyTimeoutOrDefault()))
+			return sksv1alpha1.PhaseFailed, nil
+		}
 		nr.Status.Message = fmt.Sprintf(
 			"nodepool %s has %d/%d Ready node(s)", pool.Name, ready, want)
 		return nr.Status.Phase, errRetry
@@ -337,6 +347,10 @@ func (r *NodeReplacementReconciler) handleWaitingForNode(
 	info := nodes.Classify(newest)
 	nr.Status.ReplacementNodeName = newest.Name
 	nr.Status.ReplacementNodeVersion = info.KubeletVersion
+	if nr.Status.ReplacementNodeReadyAt == nil {
+		readyAt := r.timestamp()
+		nr.Status.ReplacementNodeReadyAt = &readyAt
+	}
 
 	// The surge doubles as the probe for whether the target is obtainable at
 	// all. If the fresh node came up below it, the old node is left untouched
@@ -356,9 +370,113 @@ func (r *NodeReplacementReconciler) handleWaitingForNode(
 		return sksv1alpha1.PhaseFailed, nil
 	}
 
+	if wait, err := r.awaitNodeDaemonSets(ctx, nr, policy, newest.Name); err != nil || wait {
+		return nr.Status.Phase, err
+	}
+
 	r.Recorder.Eventf(nr, nil, corev1.EventTypeNormal, "ReplacementNodeReady", "Waiting",
 		"node %s is Ready at %s", newest.Name, info.KubeletVersion)
 	return sksv1alpha1.PhaseCordoning, nil
+}
+
+// awaitNodeDaemonSets holds the rotation until the replacement node's
+// DaemonSet pods are Ready, so the drain does not move workloads onto a node
+// whose CNI, CSI or ingress agents are still pulling images.
+//
+// It reports whether to keep waiting. On expiry it warns and lets the rotation
+// proceed: the node is genuinely there, and failing here would roll back a
+// perfectly good surge over what is only a slow image pull.
+func (r *NodeReplacementReconciler) awaitNodeDaemonSets(
+	ctx context.Context,
+	nr *sksv1alpha1.NodeReplacement,
+	policy *sksv1alpha1.NodeUpgradePolicy,
+	nodeName string,
+) (bool, error) {
+	settle := policy.Spec.Rollout.SettleTimeoutOrDefault()
+	if settle <= 0 || r.Clientset == nil {
+		return false, nil
+	}
+
+	notReady, err := nodes.DaemonSetPodsNotReady(ctx, r.Clientset, nodeName)
+	if err != nil {
+		return false, err
+	}
+	if len(notReady) == 0 {
+		return false, nil
+	}
+
+	if r.since(nr.Status.ReplacementNodeReadyAt) > settle {
+		msg := fmt.Sprintf(
+			"proceeding with %d DaemonSet pod(s) still not Ready on %s after %s: %s",
+			len(notReady), nodeName, settle, nodes.Summarize(notReady))
+		r.Recorder.Eventf(nr, nil, corev1.EventTypeWarning, "DaemonSetsNotReady", "Waiting", "%s", msg)
+		nr.Status.Message = msg
+		return false, nil
+	}
+
+	nr.Status.Message = fmt.Sprintf(
+		"waiting for %d DaemonSet pod(s) on %s: %s",
+		len(notReady), nodeName, nodes.Summarize(notReady))
+	return true, errRetry
+}
+
+// handleSettling waits for the pods this rotation displaced to be schedulable
+// again before the replacement counts as done.
+//
+// This is what makes the cooldown mean something. Until it exists, completedAt
+// is stamped the moment the old node disappears, so the next rotation can start
+// draining the last warm node while this one's replacement still has dozens of
+// pods in ContainerCreating -- and the workloads have nowhere left to land.
+func (r *NodeReplacementReconciler) handleSettling(
+	ctx context.Context,
+	nr *sksv1alpha1.NodeReplacement,
+	policy *sksv1alpha1.NodeUpgradePolicy,
+) (sksv1alpha1.ReplacementPhase, error) {
+	settle := policy.Spec.Rollout.SettleTimeoutOrDefault()
+	if settle <= 0 || r.Clientset == nil {
+		nr.Status.Message = completionMessage(nr)
+		return sksv1alpha1.PhaseCompleted, nil
+	}
+
+	var since time.Time
+	if nr.Status.StartedAt != nil {
+		since = nr.Status.StartedAt.Time
+	}
+
+	pending, err := nodes.PendingPodsSince(ctx, r.Clientset, since)
+	if err != nil {
+		return nr.Status.Phase, err
+	}
+	if len(pending) == 0 {
+		nr.Status.Message = completionMessage(nr)
+		return sksv1alpha1.PhaseCompleted, nil
+	}
+
+	if r.phaseElapsed(nr) > settle {
+		msg := fmt.Sprintf("completing with %d pod(s) still pending after %s: %s",
+			len(pending), settle, nodes.Summarize(pending))
+		r.Recorder.Eventf(nr, nil, corev1.EventTypeWarning, "SettleTimeout", "Settling", "%s", msg)
+		nr.Status.Message = msg
+		return sksv1alpha1.PhaseCompleted, nil
+	}
+
+	nr.Status.Message = fmt.Sprintf("waiting for %d displaced pod(s): %s",
+		len(pending), nodes.Summarize(pending))
+	return nr.Status.Phase, errRetry
+}
+
+// managesOwnDeadline reports whether a phase bounds its own waiting, and so
+// must be exempt from the generic wait budget.
+func managesOwnDeadline(p sksv1alpha1.ReplacementPhase) bool {
+	return p == sksv1alpha1.PhaseWaitingForNode || p == sksv1alpha1.PhaseSettling
+}
+
+// since returns how long ago t was, or 0 when it is unset.
+func (r *NodeReplacementReconciler) since(t *metav1.Time) time.Duration {
+	if t == nil {
+		return 0
+	}
+	return r.now().Sub(t.Time)
 }
 
 // handleCordoning marks the outdated node unschedulable so nothing new lands on
@@ -437,8 +555,7 @@ func (r *NodeReplacementReconciler) handleEvicting(
 		return nr.Status.Phase, err
 	}
 	if node == nil {
-		nr.Status.Message = completionMessage(nr)
-		return sksv1alpha1.PhaseCompleted, nil
+		return sksv1alpha1.PhaseSettling, nil
 	}
 
 	if nr.Status.ActionIssued {
@@ -486,8 +603,7 @@ func (r *NodeReplacementReconciler) handleDeleting(
 		return nr.Status.Phase, err
 	}
 	if node == nil {
-		nr.Status.Message = completionMessage(nr)
-		return sksv1alpha1.PhaseCompleted, nil
+		return sksv1alpha1.PhaseSettling, nil
 	}
 
 	if nr.Status.ActionIssued {

@@ -206,6 +206,10 @@ func (in *NodeReplacementStatus) DeepCopyInto(out *NodeReplacementStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.ReplacementNodeReadyAt != nil {
+		in, out := &in.ReplacementNodeReadyAt, &out.ReplacementNodeReadyAt
+		*out = (*in).DeepCopy()
+	}
 	if in.StartedAt != nil {
 		in, out := &in.StartedAt, &out.StartedAt
 		*out = (*in).DeepCopy()
@@ -306,7 +310,7 @@ func (in *NodeUpgradePolicySpec) DeepCopyInto(out *NodeUpgradePolicySpec) {
 		}
 	}
 	out.VersionPolicy = in.VersionPolicy
-	out.Rollout = in.Rollout
+	in.Rollout.DeepCopyInto(&out.Rollout)
 	in.Drain.DeepCopyInto(&out.Drain)
 	in.Strategies.DeepCopyInto(&out.Strategies)
 }
@@ -361,6 +365,11 @@ func (in *RolloutSpec) DeepCopyInto(out *RolloutSpec) {
 	*out = *in
 	out.Cooldown = in.Cooldown
 	out.NodeReadyTimeout = in.NodeReadyTimeout
+	if in.SettleTimeout != nil {
+		in, out := &in.SettleTimeout, &out.SettleTimeout
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	out.ReplacementTimeout = in.ReplacementTimeout
 }
 

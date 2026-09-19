@@ -10,7 +10,7 @@ spec:
 
   # Both are discovered from the nodes when omitted.
   exoscale:
-    zone: de-muc-1
+    zone: ch-gva-2
     # clusterID: ""
 
   # Replacements only START inside a window. One already in flight always runs
@@ -33,6 +33,13 @@ spec:
     cooldown: 5m
     nodeReadyTimeout: 15m
     replacementTimeout: 45m
+    # A node goes Ready with no workload images pulled. This bounds two waits on
+    # workloads rather than nodes: the replacement's DaemonSets becoming Ready
+    # before anything is drained onto it, and the displaced pods being scheduled
+    # again before the rotation counts as done (so the cooldown starts from a
+    # warm node, not a cold one). Neither ever fails a replacement -- on expiry
+    # they warn and proceed. 0 disables both.
+    settleTimeout: 10m
 
   drain:
     enabled: true

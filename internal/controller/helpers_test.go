@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -71,7 +72,7 @@ func newSKSNode(name, poolID, kubelet, instanceID string) *corev1.Node {
 			Name: name,
 			Labels: map[string]string{
 				nodes.SKSNodepoolIDLabel: poolID,
-				nodes.RegionLabel:        "de-muc-1",
+				nodes.RegionLabel:        "ch-gva-2",
 			},
 		},
 		Spec: corev1.NodeSpec{ProviderID: nodes.ProviderIDPrefix + instanceID},
@@ -94,7 +95,7 @@ func newKarpenterNode(name, pool, kubelet, instanceID string) *corev1.Node {
 			Name: name,
 			Labels: map[string]string{
 				nodes.KarpenterNodePoolLabel: pool,
-				nodes.ZoneLabel:              "de-muc-1",
+				nodes.ZoneLabel:              "ch-gva-2",
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: nodes.NodeClaimAPIVersion,
@@ -215,6 +216,16 @@ func cleanup() {
 	Expect(k8sClient.DeleteAllOf(ctx, &sksv1alpha1.NodeUpgradePolicy{})).To(Succeed())
 	Expect(k8sClient.DeleteAllOf(ctx, &corev1.Node{})).To(Succeed())
 
+	// envtest runs no kubelet, so a pod bound to a node would linger in
+	// Terminating forever and every later spec's Settling phase would wait on
+	// it. Force them away.
+	Expect(k8sClient.DeleteAllOf(ctx, &corev1.Pod{},
+		client.InNamespace(podNamespace),
+		client.GracePeriodSeconds(0))).To(Succeed())
+	Expect(k8sClient.DeleteAllOf(ctx, &appsv1.DaemonSet{},
+		client.InNamespace(podNamespace))).To(Succeed())
+	Eventually(func() int { return len(listPods()) }).Should(Equal(0))
+
 	claims := &unstructured.UnstructuredList{}
 	claims.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: nodes.NodeClaimGroup, Version: nodes.NodeClaimVersion, Kind: nodes.NodeClaimKind + "List",
@@ -226,6 +237,79 @@ func cleanup() {
 	}
 
 	Eventually(func() int { return len(listReplacements()) }).Should(Equal(0))
+}
+
+// podNamespace holds every pod fixture, so cleanup can scope its deletes.
+const podNamespace = "default"
+
+func listPods() []corev1.Pod {
+	var list corev1.PodList
+	Expect(k8sClient.List(ctx, &list, client.InNamespace(podNamespace))).To(Succeed())
+	return list.Items
+}
+
+// newDaemonSet creates a DaemonSet to own pod fixtures. Nothing reconciles it;
+// it exists so its pods carry a real owner reference.
+func newDaemonSet(name string) *appsv1.DaemonSet {
+	selector := map[string]string{"app": name}
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: podNamespace},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: selector},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "busybox"}}},
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, ds)).To(Succeed())
+	return ds
+}
+
+// newPod creates a pod. With no scheduler in envtest it stays Pending, which is
+// exactly the cold-start state the settle waits are about.
+func newPod(name string, mutate ...func(*corev1.Pod)) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: podNamespace},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "c", Image: "busybox"}},
+		},
+	}
+	for _, m := range mutate {
+		m(pod)
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	return pod
+}
+
+// ownedBy binds a pod fixture to a DaemonSet and a node.
+func ownedBy(ds *appsv1.DaemonSet, nodeName string) func(*corev1.Pod) {
+	return func(pod *corev1.Pod) {
+		pod.Spec.NodeName = nodeName
+		pod.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1",
+			Kind:       "DaemonSet",
+			Name:       ds.Name,
+			UID:        ds.UID,
+			Controller: ptr(true),
+		}}
+	}
+}
+
+// markPodPhase writes a pod's phase and Ready condition through the status
+// subresource, standing in for the kubelet.
+func markPodPhase(pod *corev1.Pod, phase corev1.PodPhase, isReady bool) {
+	status := corev1.ConditionFalse
+	if isReady {
+		status = corev1.ConditionTrue
+	}
+	pod.Status.Phase = phase
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type:               corev1.PodReady,
+		Status:             status,
+		LastTransitionTime: metav1.Now(),
+	}}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
 // corev1Taint builds a NoSchedule taint with the given key.

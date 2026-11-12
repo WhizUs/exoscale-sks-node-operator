@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2026 WhizUs.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -81,8 +81,8 @@ var (
 	}, []string{labelPolicy, "pool_type", "result"})
 
 	// NodepoolState exposes each observed SKS nodepool's state as a label.
-	// A pool stuck outside "running" is the failure mode behind the 2025-11-28
-	// incident, so it has to be alertable.
+	// A pool stuck outside "running" cannot be scaled or evicted, so it has to
+	// be alertable.
 	NodepoolState = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: namespace,
 		Name:      "nodepool_state",
